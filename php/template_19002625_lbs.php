@@ -10,6 +10,7 @@
 
 [e#8 important  = Admin-Interface#init=1 ]
 
+[v#1            = 0] // Exec
 ###[/DEF]###
 
 ###[HELP]###
