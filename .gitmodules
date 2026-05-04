@@ -1,0 +1,3 @@
+[submodule "php/waveshare"]
+	path = php/waveshare
+	url = https://github.com/sipiyou/waveshare-rs485-php-tcp-connector.git
