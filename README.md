@@ -8,6 +8,26 @@ Communication runs locally — no cloud required.
 - Samsung device with NASA protocol (F1/F2 bus), tested with Samsung AC
 - [Waveshare RS485-to-Ethernet converter](https://github.com/sipiyou/waveshare-rs485-php-tcp-connector)
 
+## Quickstart
+
+```bash
+# 1. Clone including the Waveshare submodule
+git clone --recurse-submodules https://github.com/sipiyou/samsung-nasa-rs485-php-connector.git
+cd samsung-nasa-rs485-php-connector
+
+# 2. Build the Edomi LBS
+cd php/edomi
+php compile.php
+```
+
+Then import `php/edomi/19002625_lbs.php` into Edomi and configure:
+
+| Input | Value |
+|-------|-------|
+| E2 | Waveshare IP address |
+| E3 | Waveshare port (default: `4196`) |
+| E1 | `1` to start |
+
 ## Cloning
 
 This repository uses a Git submodule for the Waveshare TCP connector class.
