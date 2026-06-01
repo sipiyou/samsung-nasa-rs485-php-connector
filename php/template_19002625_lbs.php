@@ -1,5 +1,5 @@
 ###[DEF]###
-[name           = Samsung NASA Protocol Connector v1.03 ]
+[name           = Samsung NASA Protocol Connector v1.05 ]
 
 [e#1 trigger    = (Re)Start/Stopp ]
 [e#2 important  = Waveshare IP ]
@@ -66,6 +66,13 @@ Die KO-Zuordnung (NASA Message-ID &lt;-&gt; Edomi-KO) erfolgt über die Admin-Ob
 Nach Änderungen in der Admin: LBS über E1=0 stoppen und E1=1 neu starten.
 
 <h2><center>Änderungshistorie</center></h2>
+<b>v1.05 – 2026-06-01</b><br>
+- Optimierung: socket_select-Timeout von 10ms auf 50ms erhöht (20 statt 100 Iterationen/Sek)<br>
+- Optimierung: logic_getInputsQueued nur noch alle 200ms aufgerufen — reduziert DB-Last deutlich<br>
+<br>
+<b>v1.04 – 2026-05-31</b><br>
+- Neu: ACK-basierter Retry — nach jedem Write-Befehl wird auf DataType::Ack vom Innengerät gewartet; bleibt die Bestätigung aus, wird der Befehl bis zu 3× wiederholt (3-Sekunden-Timeout, retryCount im Paketheader inkrementiert); DataType::Nack bricht sofort ab<br>
+<br>
 <b>v1.02 – 2026-05-02</b><br>
 - Neu: Bus-Sleep-Erkennung (E7-Timeout) — A1=1 wenn kein RX seit E7 Sekunden<br>
 - Neu: Automatischer Sleep-Retry — erster Befehl nach Bus-Sleep wird einmal wiederholt (Re-Enqueue, E6-Delay)<br>
@@ -371,7 +378,7 @@ loadKoMap($id);
 
 // ---- Waveshare verbinden ----
 
-$waveshare = new WaveshareClient('exec_debug_ws', $wsHost, $wsPort, 2, 10);
+$waveshare = new WaveshareClient('exec_debug_ws', $wsHost, $wsPort, 2, 50);
 
 exec_debug(1, "Verbinde mit Waveshare $wsHost:$wsPort ...");
 if (!$waveshare->connect()) {
@@ -392,11 +399,13 @@ $dataBlock     = [];
 $receiving     = false;
 $expectedLen   = 0;       // erwartete Paketlänge (aus Längenfeld)
 $lastStatus    = array(); // [koID => letzter geschriebener Wert] — Send-by-Change
-$cmdQueue      = array(); // ['addr+msgNum' => [address, msgNum, rawValue, koValue]] — Send-Queue
+$cmdQueue      = array(); // ['addr:msgNum' => [address, msgNum, rawValue, koValue, retryCount]] — Send-Queue
 $cmdQueueKeys  = array(); // geordnete Schlüsselliste (FIFO, neuester Wert gewinnt)
+$pendingAck    = array(); // ['addr:msgNum' => [entry, time, retries]] — wartet auf DataType::Ack
 $lastSendTime  = 0.0;     // microtime des letzten gesendeten Befehls
 $lastRxTime    = time();  // Zeitpunkt des letzten empfangenen Socket-Datenblocks
 $busSleepState = -1;      // -1=unbekannt, 0=aktiv, 1=schläft
+$lastInputCheck = 0.0;    // microtime des letzten logic_getInputsQueued-Aufrufs
 
 do {
     $binData = $waveshare->readDataAsBinaryArray();
@@ -436,20 +445,24 @@ do {
         }
     }
 
-    if ($E = logic_getInputsQueued($id)) {
-        if (isset($E[1]['refresh']) && $E[1]['refresh'] && (int)$E[1]['value'] !== 1) {
-            exec_debug(1, "E1=" . (int)$E[1]['value'] . " gesetzt. LBS beenden.");
-            break;
+    $now = microtime(true);
+    if ($now - $lastInputCheck >= 0.2) {
+        $lastInputCheck = $now;
+        if ($E = logic_getInputsQueued($id)) {
+            if (isset($E[1]['refresh']) && $E[1]['refresh'] && (int)$E[1]['value'] !== 1) {
+                exec_debug(1, "E1=" . (int)$E[1]['value'] . " gesetzt. LBS beenden.");
+                break;
+            }
+            if (isset($E[6]['refresh']) && $E[6]['refresh']) {
+                $cmdDelay = (int)$E[6]['value'] / 1000.0;
+                exec_debug(2, "E6: Befehls-Pause aktualisiert: " . (int)$E[6]['value'] . "ms");
+            }
+            if (isset($E[7]['refresh']) && $E[7]['refresh']) {
+                $busSleepTimeout = (int)$E[7]['value'];
+                exec_debug(2, "E7: Bus-Sleep-Timeout aktualisiert: " . $busSleepTimeout . "s");
+            }
+            processEdomiRequests($E, $cmdQueue, $cmdQueueKeys);
         }
-        if (isset($E[6]['refresh']) && $E[6]['refresh']) {
-            $cmdDelay = (int)$E[6]['value'] / 1000.0;
-            exec_debug(2, "E6: Befehls-Pause aktualisiert: " . (int)$E[6]['value'] . "ms");
-        }
-        if (isset($E[7]['refresh']) && $E[7]['refresh']) {
-            $busSleepTimeout = (int)$E[7]['value'];
-            exec_debug(2, "E7: Bus-Sleep-Timeout aktualisiert: " . $busSleepTimeout . "s");
-        }
-        processEdomiRequests($E, $cmdQueue, $cmdQueueKeys);
     }
 
     // Queue-Versand: ein Befehl pro Iteration, mit konfigurierter Pause
@@ -460,8 +473,9 @@ do {
             if (isset($cmdQueue[$key])) {
                 $entry = $cmdQueue[$key];
                 unset($cmdQueue[$key]);
-                if ($debugLevel >= 2) exec_debug(2, sprintf("TX NASA 0x%X = %s (raw=%d) an %s", $entry['msgNum'], $entry['koValue'], $entry['rawValue'], $entry['address']));
+                if ($debugLevel >= 2) exec_debug(2, sprintf("TX NASA 0x%X = %s (raw=%d) an %s%s", $entry['msgNum'], $entry['koValue'], $entry['rawValue'], $entry['address'], ($entry['retryCount'] ?? 0) > 0 ? ' [Retry '.($entry['retryCount']).']' : ''));
                 $packet  = Packet::create(Address::parse($entry['address']), DataType::Write, $entry['msgNum'], $entry['rawValue']);
+                $packet->command->retryCount = $entry['retryCount'] ?? 0;
                 $encoded = $packet->encode();
                 if ($debugLevel >= 5) exec_debug(5, sprintf("TX Roh-Daten (%d Bytes): %s", count($encoded), implode(' ', array_map(fn($b) => sprintf('%02X', $b), $encoded))));
                 $txOk = $waveshare->writeArrayToSocket($encoded);
@@ -477,19 +491,52 @@ do {
                         exec_debug(0, "Reconnect fehlgeschlagen. Befehl verworfen.");
                     }
                 }
-                // Bus-Sleep-Retry: Bus war eingeschlafen → ersten Befehl einmal wiederholen.
-                // Re-Enqueue an Queuekopf (E6-Delay läuft automatisch über $lastSendTime).
-                // Nur wenn kein neuerer Befehl für dieselbe Adresse bereits wartet.
+                // Bus-Sleep-Retry: Bus war eingeschlafen → ersten Befehl einmal sofort wiederholen.
                 if ($txOk && $busSleepState === 1 && empty($entry['sleepRetry'])) {
                     if (!isset($cmdQueue[$key])) {
-                        $entry['sleepRetry'] = true;
+                        $retry = $entry;
+                        $retry['sleepRetry']  = true;
+                        $retry['retryCount']  = 1;
                         array_unshift($cmdQueueKeys, $key);
-                        $cmdQueue[$key] = $entry;
-                        exec_debug(1, sprintf("Bus-Sleep: 0x%X für Wiederholung in Queue (E6=%dms).", $entry['msgNum'], (int)($cmdDelay * 1000)));
+                        $cmdQueue[$key] = $retry;
+                        exec_debug(1, sprintf("Bus-Sleep: 0x%X für Sofort-Wiederholung in Queue (E6=%dms).", $entry['msgNum'], (int)($cmdDelay * 1000)));
                     }
+                }
+                // ACK-Tracking: Eintrag anlegen; wird bei DataType::Ack vom Gerät entfernt.
+                // PHP_FLOAT_MAX verhindert vorzeitige Wiederholung falls der Sleep-Retry
+                // gerade nochmal sendet — TX-Block setzt 'time' bei jedem Senden neu.
+                if ($txOk) {
+                    $pendingAck[$key] = [
+                        'entry'   => $entry,
+                        'time'    => $now,
+                        'retries' => $entry['retryCount'] ?? 0,
+                    ];
                 }
                 $lastSendTime = $now;
             }
+        }
+    }
+
+    // ACK-Timeout: ausstehende Bestätigungen prüfen und bei Bedarf wiederholen
+    if (!empty($pendingAck)) {
+        $now = microtime(true);
+        foreach ($pendingAck as $qKey => $pending) {
+            if ($now - $pending['time'] < 3.0) continue;
+            if ($pending['retries'] >= 3) {
+                exec_debug(0, sprintf("Befehl 0x%X an %s nach 3 Versuchen ohne ACK verworfen.", $pending['entry']['msgNum'], $pending['entry']['address']));
+                unset($pendingAck[$qKey]);
+                continue;
+            }
+            // Noch nicht in Queue → einreihen; timer auf MAX damit kein Doppel-Enqueue
+            if (!isset($cmdQueue[$qKey])) {
+                $entry = $pending['entry'];
+                $entry['retryCount'] = $pending['retries'] + 1;
+                $cmdQueueKeys[] = $qKey;
+                $cmdQueue[$qKey] = $entry;
+            }
+            $pendingAck[$qKey]['retries'] = $pending['retries'] + 1;
+            $pendingAck[$qKey]['time']    = PHP_FLOAT_MAX; // TX-Block setzt 'time' neu beim Senden
+            exec_debug(1, sprintf("Kein ACK von %s für 0x%X — Versuch %d/3 in Queue.", $pending['entry']['address'], $pending['entry']['msgNum'], $pending['retries'] + 1));
         }
     }
 
@@ -529,14 +576,45 @@ function sendWakePacket() {
 // ---- Paketverarbeitung ----
 
 function processPacket(array $dataBlock) {
-    global $nasaDecoder, $koMapRead, $knownEntities, $debugLevel, $lastStatus;
+    global $nasaDecoder, $koMapRead, $knownEntities, $debugLevel, $lastStatus, $pendingAck;
 
     $packet = new Packet();
     if ($packet->decode($dataBlock) !== 'Ok') {
         return;
     }
 
-    $srcAddr = $packet->sa->toString();
+    $srcAddr  = $packet->sa->toString();
+    $dataType = $packet->command->dataType;
+
+    // ACK/NACK/Response vom Innengerät → pending Bestätigungen abgleichen.
+    // Samsung-Geräte antworten auf Write (2) mit Response (5), nicht mit Ack (6).
+    // Response enthält die bestätigten Werte → als ACK werten UND weiter verarbeiten.
+    if ($dataType === DataType::Ack || $dataType === DataType::Nack || $dataType === DataType::Response) {
+        if ($dataType === DataType::Nack) {
+            exec_debug(1, "NACK von $srcAddr — Befehl abgelehnt.");
+        }
+        if (!empty($packet->messages)) {
+            foreach ($packet->messages as $msg) {
+                $qKey = $srcAddr . ':' . $msg->messageNumber;
+                if (isset($pendingAck[$qKey])) {
+                    if ($debugLevel >= 2) {
+                        $label = $dataType === DataType::Nack ? 'NACK' : ($dataType === DataType::Response ? 'Response' : 'ACK');
+                        exec_debug(2, sprintf("%s von %s für 0x%X — pending entfernt.", $label, $srcAddr, $msg->messageNumber));
+                    }
+                    unset($pendingAck[$qKey]);
+                }
+            }
+        } else {
+            foreach (array_keys($pendingAck) as $qKey) {
+                if (strpos($qKey, $srcAddr . ':') === 0) {
+                    unset($pendingAck[$qKey]);
+                }
+            }
+        }
+        // Ack/Nack haben keine Nutzdaten — früh raus.
+        // Response enthält gültige Werte → weiter verarbeiten.
+        if ($dataType === DataType::Ack || $dataType === DataType::Nack) return;
+    }
 
     foreach ($packet->messages as $msg) {
         $msgNum = $msg->messageNumber;
